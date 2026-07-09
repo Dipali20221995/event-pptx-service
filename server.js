@@ -12,6 +12,39 @@ const API_KEY = process.env.API_KEY || '';
 
 app.get('/', (req, res) => res.send('Event PPTX service is running.'));
 
+// n8n's "Compress Image (External)" node sends the raw image bytes directly
+// as the POST body (contentType: binaryData), not as multipart/form-data,
+// so this route reads the raw body rather than using multer.
+app.post('/compress-image', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
+  try {
+    if (API_KEY) {
+      const provided = req.header('x-api-key') || '';
+      if (provided !== API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    if (!req.body || !req.body.length) {
+      return res.status(400).json({ error: 'Missing image body' });
+    }
+
+    const quality = parseInt(req.query.quality, 10) || 80;
+    const maxWidth = parseInt(req.query.maxWidth, 10) || 1280;
+    const maxHeight = parseInt(req.query.maxHeight, 10) || 1280;
+
+    const buf = await sharp(req.body)
+      .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality })
+      .toBuffer();
+
+    res.set('Content-Type', 'image/jpeg');
+    res.send(buf);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 app.post('/generate-pptx', upload.any(), async (req, res) => {
   try {
     if (API_KEY) {
