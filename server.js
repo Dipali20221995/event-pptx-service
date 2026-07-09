@@ -39,7 +39,7 @@ app.post('/compress-image', express.raw({ type: '*/*', limit: '30mb' }), async (
       return res.status(400).json({ error: 'No image data received' });
     }
 
-    const outputBuffer = await sharp(inputBuffer, { limitInputPixels: 60000000 })
+    const outputBuffer = await sharp(inputBuffer, { limitInputPixels: 200000000 })
       .rotate() // auto-orient based on EXIF, then strip EXIF to save space
       .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality, mozjpeg: true })
