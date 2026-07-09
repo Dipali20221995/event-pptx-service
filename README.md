@@ -1,31 +1,30 @@
-# Event PPTX Generation Service (v2 - JSON based)
+# Event PPTX Generation Service (v3 - now with image compression)
 
-Builds your branded event PowerPoint outside n8n (n8n Cloud's Code node can't use pptxgenjs/sharp).
+Builds your branded event PowerPoint AND compresses oversized photos, both
+outside n8n (n8n Cloud's Starter plan has only 320MB RAM per execution,
+which is too tight to decode/resize large phone photos).
 
 ## Update your existing Render deployment
 
-You already deployed this once. To update it with the new version:
 1. Go to your GitHub repo (`event-pptx-service`).
-2. Open `server.js` in the repo, click the pencil (Edit) icon.
-3. Delete everything, paste in the new `server.js` content from this folder. Commit.
-4. Do the same for `package.json`.
-5. Render will auto-detect the GitHub change and redeploy automatically (watch the Events/Logs tab).
+2. Open `server.js`, click the pencil (Edit) icon.
+3. Select all, delete, paste in the new `server.js` content from this folder. Commit.
+4. Render auto-redeploys within ~1-2 minutes (watch the Events tab).
 
-No changes needed to your Environment Variables (API_KEY stays the same).
+No changes to `package.json` or your Environment Variables needed.
 
-## API
+## New endpoint: /compress-image
 
-POST to `https://YOUR-URL.onrender.com/generate-pptx` with:
+POST any image (any size) as raw bytes, get back a small compressed JPEG.
+
+- URL: `https://YOUR-URL.onrender.com/compress-image?quality=70&maxWidth=1280&maxHeight=1280`
 - Header: `x-api-key: <your API_KEY>`
-- Header: `Content-Type: application/json`
-- Body (JSON):
-```json
-{
-  "slides": [...],
-  "eventData": {...},
-  "accentColor": "#...", "secondaryColor": "#...", "bgColor": "#...", "darkColor": "#...",
-  "logoBase64": "data:image/png;base64,....",
-  "images": ["data:image/jpeg;base64,....", "..."]
-}
-```
-Response: binary `.pptx` file.
+- Header: `Content-Type: application/octet-stream` (or the image's real mimetype)
+- Body: raw image bytes
+- Response: compressed JPEG bytes
+
+Tested: a 10.5MB photo compresses to ~490KB at these settings.
+
+## Existing /generate-pptx endpoint
+
+Unchanged from before — still builds the branded PPTX from JSON slide data + base64 images.
