@@ -11,6 +11,48 @@ const API_KEY = process.env.API_KEY || '';
 
 app.get('/', (req, res) => res.send('Event PPTX service is running.'));
 
+function checkAuth(req, res) {
+  if (API_KEY) {
+    const provided = req.header('x-api-key') || '';
+    if (provided !== API_KEY) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return false;
+    }
+  }
+  return true;
+}
+
+// Accepts a raw image (any size) as the request body and returns a small,
+// compressed JPEG. This keeps the expensive decode/resize work off n8n
+// entirely, since n8n's own memory allocation is often too tight for large
+// photos (especially on free/starter tiers).
+app.post('/compress-image', express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
+  try {
+    if (!checkAuth(req, res)) return;
+
+    const maxWidth = parseInt(req.query.maxWidth || '1280', 10);
+    const maxHeight = parseInt(req.query.maxHeight || '1280', 10);
+    const quality = parseInt(req.query.quality || '70', 10);
+
+    const inputBuffer = req.body;
+    if (!inputBuffer || !inputBuffer.length) {
+      return res.status(400).json({ error: 'No image data received' });
+    }
+
+    const outputBuffer = await sharp(inputBuffer, { limitInputPixels: 60000000 })
+      .rotate() // auto-orient based on EXIF, then strip EXIF to save space
+      .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+
+    res.set('Content-Type', 'image/jpeg');
+    res.send(outputBuffer);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function toBuffer(base64OrDataUrl) {
   if (!base64OrDataUrl) return null;
   const comma = base64OrDataUrl.indexOf(',');
