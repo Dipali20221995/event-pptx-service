@@ -1,10 +1,9 @@
 const express = require('express');
-const multer = require('multer');
 const PptxGenJS = require('pptxgenjs');
 const sharp = require('sharp');
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+app.use(express.json({ limit: '50mb' }));
 
 // Simple shared-secret auth so randoms on the internet can't hit your endpoint.
 // Set API_KEY as an environment variable on your host; n8n sends it as a header.
@@ -12,7 +11,16 @@ const API_KEY = process.env.API_KEY || '';
 
 app.get('/', (req, res) => res.send('Event PPTX service is running.'));
 
-app.post('/generate-pptx', upload.any(), async (req, res) => {
+function toBuffer(base64OrDataUrl) {
+  if (!base64OrDataUrl) return null;
+  const comma = base64OrDataUrl.indexOf(',');
+  const raw = base64OrDataUrl.startsWith('data:') && comma !== -1
+    ? base64OrDataUrl.slice(comma + 1)
+    : base64OrDataUrl;
+  return Buffer.from(raw, 'base64');
+}
+
+app.post('/generate-pptx', async (req, res) => {
   try {
     if (API_KEY) {
       const provided = req.header('x-api-key') || '';
@@ -21,28 +29,13 @@ app.post('/generate-pptx', upload.any(), async (req, res) => {
       }
     }
 
-    if (!req.body.payload) {
-      return res.status(400).json({ error: 'Missing "payload" field (JSON string)' });
-    }
-
-    const inputData = JSON.parse(req.body.payload);
+    const inputData = req.body || {};
     const slides = inputData.slides || [];
     const eventData = inputData.eventData || {};
+    const logoBuffer = toBuffer(inputData.logoBase64);
+    const imageBuffers = (inputData.images || []).map(toBuffer).filter(Boolean);
 
-    // ---- classify uploaded files into logo vs reference images ----
-    const files = req.files || [];
-    let logoFile = null;
-    const refFiles = [];
-    for (const f of files) {
-      const nameHint = ((f.fieldname || '') + (f.originalname || '')).toLowerCase();
-      if (nameHint.includes('logo') && !logoFile) {
-        logoFile = f;
-      } else {
-        refFiles.push(f);
-      }
-    }
-
-    const buf = await buildPresentation({ inputData, slides, eventData, logoFile, refFiles });
+    const buf = await buildPresentation({ inputData, slides, eventData, logoBuffer, imageBuffers });
 
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
     res.set('Content-Disposition', `attachment; filename="presentation.pptx"`);
@@ -53,7 +46,7 @@ app.post('/generate-pptx', upload.any(), async (req, res) => {
   }
 });
 
-async function buildPresentation({ inputData, slides, eventData, logoFile, refFiles }) {
+async function buildPresentation({ inputData, slides, eventData, logoBuffer, imageBuffers }) {
   // ── THEME COLOR SYSTEM ─────────────────────────────────────────
   const accent    = (inputData.accentColor    || '#B38E58').replace('#', '');
   const secondary = (inputData.secondaryColor || '#D4B896').replace('#', '');
@@ -79,9 +72,9 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
   const refImgs = [];
   let logoB64 = null;
 
-  if (logoFile) {
+  if (logoBuffer) {
     try {
-      const lb = await sharp(logoFile.buffer)
+      const lb = await sharp(logoBuffer)
         .resize(200, 100, { fit: 'inside', background: { r: 255, g: 255, b: 255, alpha: 0 } })
         .png()
         .toBuffer();
@@ -89,9 +82,9 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     } catch (e) { /* skip bad logo */ }
   }
 
-  for (const f of refFiles) {
+  for (const b of imageBuffers) {
     try {
-      const rb = await sharp(f.buffer)
+      const rb = await sharp(b)
         .resize(1280, 720, { fit: 'cover', position: 'centre' })
         .modulate({ brightness: 1.1, saturation: 0.85 })
         .jpeg({ quality: 88 })
