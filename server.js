@@ -1,9 +1,10 @@
 const express = require('express');
+const multer = require('multer');
 const PptxGenJS = require('pptxgenjs');
 const sharp = require('sharp');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 // Simple shared-secret auth so randoms on the internet can't hit your endpoint.
 // Set API_KEY as an environment variable on your host; n8n sends it as a header.
@@ -11,58 +12,7 @@ const API_KEY = process.env.API_KEY || '';
 
 app.get('/', (req, res) => res.send('Event PPTX service is running.'));
 
-function checkAuth(req, res) {
-  if (API_KEY) {
-    const provided = req.header('x-api-key') || '';
-    if (provided !== API_KEY) {
-      res.status(401).json({ error: 'Unauthorized' });
-      return false;
-    }
-  }
-  return true;
-}
-
-// Accepts a raw image (any size) as the request body and returns a small,
-// compressed JPEG. This keeps the expensive decode/resize work off n8n
-// entirely, since n8n's own memory allocation is often too tight for large
-// photos (especially on free/starter tiers).
-app.post('/compress-image', express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
-  try {
-    if (!checkAuth(req, res)) return;
-
-    const maxWidth = parseInt(req.query.maxWidth || '1280', 10);
-    const maxHeight = parseInt(req.query.maxHeight || '1280', 10);
-    const quality = parseInt(req.query.quality || '70', 10);
-
-    const inputBuffer = req.body;
-    if (!inputBuffer || !inputBuffer.length) {
-      return res.status(400).json({ error: 'No image data received' });
-    }
-
-    const outputBuffer = await sharp(inputBuffer, { limitInputPixels: 200000000 })
-      .rotate() // auto-orient based on EXIF, then strip EXIF to save space
-      .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality, mozjpeg: true })
-      .toBuffer();
-
-    res.set('Content-Type', 'image/jpeg');
-    res.send(outputBuffer);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-function toBuffer(base64OrDataUrl) {
-  if (!base64OrDataUrl) return null;
-  const comma = base64OrDataUrl.indexOf(',');
-  const raw = base64OrDataUrl.startsWith('data:') && comma !== -1
-    ? base64OrDataUrl.slice(comma + 1)
-    : base64OrDataUrl;
-  return Buffer.from(raw, 'base64');
-}
-
-app.post('/generate-pptx', async (req, res) => {
+app.post('/generate-pptx', upload.any(), async (req, res) => {
   try {
     if (API_KEY) {
       const provided = req.header('x-api-key') || '';
@@ -71,13 +21,28 @@ app.post('/generate-pptx', async (req, res) => {
       }
     }
 
-    const inputData = req.body || {};
+    if (!req.body.payload) {
+      return res.status(400).json({ error: 'Missing "payload" field (JSON string)' });
+    }
+
+    const inputData = JSON.parse(req.body.payload);
     const slides = inputData.slides || [];
     const eventData = inputData.eventData || {};
-    const logoBuffer = toBuffer(inputData.logoBase64);
-    const imageBuffers = (inputData.images || []).map(toBuffer).filter(Boolean);
 
-    const buf = await buildPresentation({ inputData, slides, eventData, logoBuffer, imageBuffers });
+    // ---- classify uploaded files into logo vs reference images ----
+    const files = req.files || [];
+    let logoFile = null;
+    const refFiles = [];
+    for (const f of files) {
+      const nameHint = ((f.fieldname || '') + (f.originalname || '')).toLowerCase();
+      if (nameHint.includes('logo') && !logoFile) {
+        logoFile = f;
+      } else {
+        refFiles.push(f);
+      }
+    }
+
+    const buf = await buildPresentation({ inputData, slides, eventData, logoFile, refFiles });
 
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
     res.set('Content-Disposition', `attachment; filename="presentation.pptx"`);
@@ -88,7 +53,7 @@ app.post('/generate-pptx', async (req, res) => {
   }
 });
 
-async function buildPresentation({ inputData, slides, eventData, logoBuffer, imageBuffers }) {
+async function buildPresentation({ inputData, slides, eventData, logoFile, refFiles }) {
   // ── THEME COLOR SYSTEM ─────────────────────────────────────────
   const accent    = (inputData.accentColor    || '#B38E58').replace('#', '');
   const secondary = (inputData.secondaryColor || '#D4B896').replace('#', '');
@@ -114,9 +79,9 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
   const refImgs = [];
   let logoB64 = null;
 
-  if (logoBuffer) {
+  if (logoFile) {
     try {
-      const lb = await sharp(logoBuffer)
+      const lb = await sharp(logoFile.buffer)
         .resize(200, 100, { fit: 'inside', background: { r: 255, g: 255, b: 255, alpha: 0 } })
         .png()
         .toBuffer();
@@ -124,9 +89,9 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
     } catch (e) { /* skip bad logo */ }
   }
 
-  for (const b of imageBuffers) {
+  for (const f of refFiles) {
     try {
-      const rb = await sharp(b)
+      const rb = await sharp(f.buffer)
         .resize(1280, 720, { fit: 'cover', position: 'centre' })
         .modulate({ brightness: 1.1, saturation: 0.85 })
         .jpeg({ quality: 88 })
@@ -135,8 +100,19 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
     } catch (e) { /* skip bad image */ }
   }
 
-  let imgIdx = 0;
-  const getImg = () => (refImgs.length ? refImgs[imgIdx++ % refImgs.length] : null);
+  // Per-slide targeted image selection. Each slide object (sd) may carry an
+  // `imageIndex` chosen upstream (by the AI planning step) that refers to the
+  // position of a specific uploaded reference image. If it's missing, out of
+  // range, or null, the slide simply gets no image (existing placeholder /
+  // no-image branches below handle that gracefully) instead of forcing
+  // whatever image happens to be "next" in a round-robin.
+  const pickImg = (sd) => {
+    const idx = sd && sd.imageIndex;
+    if (typeof idx === 'number' && idx >= 0 && idx < refImgs.length) {
+      return refImgs[idx];
+    }
+    return null;
+  };
 
   // ── PPTX ──────────────────────────────────────────────────────
   const pptx = new PptxGenJS();
@@ -178,7 +154,7 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
 
   const buildCover = (sd) => {
     const slide = pptx.addSlide();
-    const img = getImg();
+    const img = pickImg(sd);
     if (img) {
       slide.addImage({ data: img, x: 4.8, y: 0, w: 5.2, h: 5.63 });
       slide.addShape(pptx.ShapeType.rect, { x: 4.8, y: 0, w: 5.2, h: 5.63, fill: { color: darkColor, alpha: 15 } });
@@ -209,7 +185,7 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
     addHeader(slide, sd.title);
-    const img = useImg ? getImg() : null;
+    const img = useImg ? pickImg(sd) : null;
     const TW = 5.65;
     const IX = 6.08, IY = CTY + 0.05, IW = 3.65, IH = 4.35;
 
@@ -239,7 +215,7 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
 
   const buildVisual = (sd) => {
     const slide = pptx.addSlide();
-    const img = getImg();
+    const img = pickImg(sd);
     if (img) {
       slide.addImage({ data: img, x: 0, y: 0, w: '100%', h: '100%' });
       slide.addShape(pptx.ShapeType.rect, { x: 0, y: 3.45, w: 10, h: 2.18, fill: { color: darkColor, alpha: 28 } });
@@ -304,7 +280,7 @@ async function buildPresentation({ inputData, slides, eventData, logoBuffer, ima
 
   const buildClosing = (sd) => {
     const slide = pptx.addSlide();
-    const img = getImg();
+    const img = pickImg(sd);
     if (img) {
       slide.addImage({ data: img, x: 0, y: 0, w: '100%', h: '100%' });
       slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: 5.63, fill: { color: darkColor, alpha: 38 } });
