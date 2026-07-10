@@ -171,6 +171,34 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
   pptx.title = escapeXml(eventData.eventName || 'Event Presentation');
   pptx.company = escapeXml(eventData.clientName || '');
 
+  // ── ICON SYSTEM ──────────────────────────────────────────────
+  // Maps a slide's title to a contextually fitting icon glyph. Using Unicode
+  // symbols/emoji (not rasterized images) means these render crisply at any
+  // zoom level, cost zero file size, need no extra dependencies on the
+  // server, and Windows/PowerPoint automatically falls back to a symbol
+  // font for any glyph Calibri itself doesn't contain (already proven by
+  // the calendar/pin icons already in use on the cover slide).
+  const ICON_MAP = [
+    [/client|about/i, '\uD83D\uDC64'],
+    [/overview/i, '\uD83D\uDCCB'],
+    [/theme|design|concept/i, '\uD83C\uDFA8'],
+    [/venue/i, '\uD83D\uDCCD'],
+    [/schedule|timeline/i, '\uD83D\uDDD3'],
+    [/guest|experience/i, '\uD83D\uDC65'],
+    [/stage|decor/i, '\u2728'],
+    [/hospitality|catering/i, '\uD83C\uDF7D'],
+    [/logistics|operations/i, '\uD83D\uDE9A'],
+    [/why choose|why us/i, '\u2B50'],
+    [/thank/i, '\uD83D\uDC90']
+  ];
+  const pickIcon = (title) => {
+    const t = String(title || '');
+    for (const [re, icon] of ICON_MAP) {
+      if (re.test(t)) return icon;
+    }
+    return '\u2726'; // default: a neutral sparkle/star for anything unmatched
+  };
+
   const addLogo = (slide) => {
     if (logoB64) {
       slide.addImage({ data: logoB64, x: LOGO_X, y: LOGO_Y, w: LOGO_W, h: LOGO_H });
@@ -187,10 +215,18 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     if (num) slide.addText(String(num), { x: 9.3, y: FTR_Y + 0.04, w: 0.55, h: 0.18, fontSize: 8, color: white, align: 'right', fontFace: FONT });
   };
 
+  // H1 (slide title, in the header bar): icon badge + uppercase bold title.
+  // Bumped from 22pt to 24pt for a stronger visual anchor, and given its
+  // own small icon badge so every content-style slide carries the same
+  // consistent "icon + heading" pattern instead of plain text alone.
   const addHeader = (slide, title) => {
     slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: HDR_H, fill: { color: accent } });
     slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.08, h: HDR_H, fill: { color: secondary } });
-    slide.addText((title || '').toUpperCase(), { x: 0.22, y: 0.1, w: LOGO_X - 0.3, h: HDR_H - 0.2, fontSize: 22, bold: true, color: white, fontFace: FONT, charSpacing: 1, valign: 'middle' });
+    const badgeD = 0.42;
+    const badgeY = HDR_H / 2 - badgeD / 2;
+    slide.addShape(pptx.ShapeType.ellipse, { x: 0.24, y: badgeY, w: badgeD, h: badgeD, fill: { color: white, alpha: 85 } });
+    slide.addText(pickIcon(title), { x: 0.24, y: badgeY, w: badgeD, h: badgeD, fontSize: 16, align: 'center', valign: 'middle' });
+    slide.addText((title || '').toUpperCase(), { x: 0.8, y: 0.1, w: LOGO_X - 0.9, h: HDR_H - 0.2, fontSize: 24, bold: true, color: white, fontFace: FONT, charSpacing: 1, valign: 'middle' });
     addLogo(slide);
   };
 
@@ -287,7 +323,7 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
     addHeader(slide, sd.title);
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 12, color: accent, italic: true, fontFace: FONT, align: 'center' });
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 13, color: accent, italic: true, fontFace: FONT, align: 'center' });
     const pts = (sd.bulletPoints || []).slice(0, 6);
     const cols = pts.length || 1;
     const colW = 9.2 / cols;
@@ -310,8 +346,7 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
     addHeader(slide, sd.title);
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 12, color: accent, italic: true, fontFace: FONT });
-    const icons = ['\u2726', '\u25C6', '\u2605', '\u25CF', '\u25B2'];
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 13, color: accent, italic: true, fontFace: FONT });
     const pts = (sd.bulletPoints || []).slice(0, 3);
     const colW = 9.2 / pts.length;
     pts.forEach((pt, i) => {
@@ -320,7 +355,7 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
       slide.addShape(pptx.ShapeType.rect, { x: cx + 0.1, y: 1.48, w: colW - 0.25, h: 0.08, fill: { color: accent } });
       slide.addShape(pptx.ShapeType.rect, { x: cx + 0.1, y: 1.56, w: colW - 0.25, h: 0.04, fill: { color: secondary } });
       slide.addShape(pptx.ShapeType.ellipse, { x: cx + colW / 2 - 0.38, y: 1.7, w: 0.76, h: 0.76, fill: { color: bgColor } });
-      slide.addText(icons[i % icons.length], { x: cx + colW / 2 - 0.38, y: 1.76, w: 0.76, h: 0.64, fontSize: 22, color: accent, align: 'center' });
+      slide.addText(pickIcon(pt), { x: cx + colW / 2 - 0.38, y: 1.76, w: 0.76, h: 0.64, fontSize: 22, color: accent, align: 'center' });
       const parts = pt.split(':');
       slide.addText(parts[0].trim(), { x: cx + 0.2, y: 2.55, w: colW - 0.45, h: 0.45, fontSize: 12.5, bold: true, color: textDark, align: 'center', fontFace: FONT });
       if (parts[1]) slide.addText(parts[1].trim(), { x: cx + 0.2, y: 3.05, w: colW - 0.45, h: 1.7, fontSize: 11, color: textGrey, align: 'center', fontFace: FONT, wrap: true });
