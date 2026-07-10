@@ -124,10 +124,15 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
 
   for (const f of refFiles) {
     try {
+      // 'attention' crop strategy analyzes the image (edges, skin tones,
+      // saturation) to keep the most visually interesting region in frame,
+      // instead of blindly cutting to the exact center — this noticeably
+      // reduces awkward crops on portrait or off-center photos. Resolution
+      // and quality bumped up for a crisper result at typical slide sizes.
       const rb = await sharp(f.buffer)
-        .resize(1280, 720, { fit: 'cover', position: 'centre' })
+        .resize(1600, 900, { fit: 'cover', position: 'attention' })
         .modulate({ brightness: 1.1, saturation: 0.85 })
-        .jpeg({ quality: 88 })
+        .jpeg({ quality: 92 })
         .toBuffer();
       refImgs.push('data:image/jpeg;base64,' + rb.toString('base64'));
     } catch (e) { /* skip bad image */ }
@@ -148,10 +153,23 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
   };
 
   // ── PPTX ──────────────────────────────────────────────────────
+  // Document metadata fields (title/company/etc.) are written into the
+  // file's internal XML without pptxgenjs escaping them automatically the
+  // way it escapes text added to slides. A raw '&', '<', '>', or '"' in a
+  // client/event name breaks that XML and makes PowerPoint report the file
+  // as corrupt. Escaping here fixes that for ANY such character, not just
+  // the one that happened to show up so far.
+  const escapeXml = (s) => String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_16x9';
-  pptx.title = eventData.eventName || 'Event Presentation';
-  pptx.company = eventData.clientName || '';
+  pptx.title = escapeXml(eventData.eventName || 'Event Presentation');
+  pptx.company = escapeXml(eventData.clientName || '');
 
   const addLogo = (slide) => {
     if (logoB64) {
@@ -326,7 +344,7 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 1.6, w: 4.4, h: 0.03, fill: { color: secondary, alpha: 70 } });
     slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 4.08, w: 4.4, h: 0.05, fill: { color: accent } });
     slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 4.02, w: 4.4, h: 0.03, fill: { color: secondary, alpha: 70 } });
-    slide.addText(sd.title || 'Thank You', { x: 0.5, y: 1.75, w: 9, h: 1.4, fontSize: 48, bold: true, color: white, align: 'center', fontFace: FONT, charSpacing: 2 });
+    slide.addText((sd.title || 'Thank You').toUpperCase(), { x: 0.5, y: 1.75, w: 9, h: 1.4, fontSize: 48, bold: true, color: white, align: 'center', fontFace: FONT, charSpacing: 2 });
     if (sd.subtitle) slide.addText(sd.subtitle, { x: 1, y: 3.28, w: 8, h: 0.55, fontSize: 15, color: 'CCCCCC', align: 'center', fontFace: FONT, italic: true });
     slide.addText((eventData.clientName || '').toUpperCase(), { x: 0.5, y: 4.22, w: 9, h: 0.4, fontSize: 13, color: accent, align: 'center', fontFace: FONT, bold: true, charSpacing: 2 });
     slide.addShape(pptx.ShapeType.rect, { x: 0, y: 5.45, w: 10, h: 0.18, fill: { color: accent } });
