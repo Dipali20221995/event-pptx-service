@@ -6,15 +6,10 @@ const sharp = require('sharp');
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// Simple shared-secret auth so randoms on the internet can't hit your endpoint.
-// Set API_KEY as an environment variable on your host; n8n sends it as a header.
 const API_KEY = process.env.API_KEY || '';
 
 app.get('/', (req, res) => res.send('Event PPTX service is running.'));
 
-// n8n's "Compress Image (External)" node sends the raw image bytes directly
-// as the POST body (contentType: binaryData), not as multipart/form-data,
-// so this route reads the raw body rather than using multer.
 app.post('/compress-image', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
   try {
     if (API_KEY) {
@@ -23,20 +18,16 @@ app.post('/compress-image', express.raw({ type: '*/*', limit: '25mb' }), async (
         return res.status(401).json({ error: 'Unauthorized' });
       }
     }
-
     if (!req.body || !req.body.length) {
       return res.status(400).json({ error: 'Missing image body' });
     }
-
     const quality = parseInt(req.query.quality, 10) || 80;
     const maxWidth = parseInt(req.query.maxWidth, 10) || 1280;
     const maxHeight = parseInt(req.query.maxHeight, 10) || 1280;
-
     const buf = await sharp(req.body)
       .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality })
       .toBuffer();
-
     res.set('Content-Type', 'image/jpeg');
     res.send(buf);
   } catch (err) {
@@ -53,16 +44,13 @@ app.post('/generate-pptx', upload.any(), async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
       }
     }
-
     if (!req.body.payload) {
       return res.status(400).json({ error: 'Missing "payload" field (JSON string)' });
     }
-
     const inputData = JSON.parse(req.body.payload);
     const slides = inputData.slides || [];
     const eventData = inputData.eventData || {};
 
-    // ---- classify uploaded files into logo vs reference images ----
     const files = req.files || [];
     let logoFile = null;
     const refFiles = [];
@@ -87,35 +75,31 @@ app.post('/generate-pptx', upload.any(), async (req, res) => {
 });
 
 async function buildPresentation({ inputData, slides, eventData, logoFile, refFiles }) {
-  // ── THEME COLOR SYSTEM ─────────────────────────────────────────
   const accent    = (inputData.accentColor    || '#B38E58').replace('#', '');
   const secondary = (inputData.secondaryColor || '#D4B896').replace('#', '');
   const bgColor   = (inputData.bgColor        || '#FBF7F2').replace('#', '');
   const darkColor = (inputData.darkColor      || '#3D2820').replace('#', '');
   const white     = 'FFFFFF';
-  const textDark  = '2C2C2C';
-  const textGrey  = '666666';
+  const textDark  = '2C2620';
+  const textGrey  = '746B60';
+  const hairline  = 'DDD5C8';
 
-  // ── FIXED DESIGN CONSTANTS ─────────────────────────────────────
-  const FONT   = 'Calibri';
-  const HDR_H  = 0.75;
-  const FTR_Y  = 5.38;
-  const FTR_H  = 0.25;
-  const LOGO_X = 8.78;
-  const LOGO_Y = 0.09;
-  const LOGO_W = 1.05;
-  const LOGO_H = 0.54;
-  const ML     = 0.35;
-  const CTY    = HDR_H + 0.15;
+  const DISPLAY = 'Georgia';
+  const BODY    = 'Calibri';
 
-  // ── PROCESS IMAGES ────────────────────────────────────────────
+  const ML     = 0.55;
+  const MR     = 9.45;
+  const FTR_Y  = 5.32;
+  const LOGO_W = 0.62;
+  const LOGO_H = 0.62;
+
   const refImgs = [];
   let logoB64 = null;
 
   if (logoFile) {
     try {
       const lb = await sharp(logoFile.buffer)
-        .resize(200, 100, { fit: 'inside', background: { r: 255, g: 255, b: 255, alpha: 0 } })
+        .resize(240, 240, { fit: 'inside', background: { r: 255, g: 255, b: 255, alpha: 0 } })
         .png()
         .toBuffer();
       logoB64 = 'data:image/png;base64,' + lb.toString('base64');
@@ -124,26 +108,15 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
 
   for (const f of refFiles) {
     try {
-      // 'attention' crop strategy analyzes the image (edges, skin tones,
-      // saturation) to keep the most visually interesting region in frame,
-      // instead of blindly cutting to the exact center — this noticeably
-      // reduces awkward crops on portrait or off-center photos. Resolution
-      // and quality bumped up for a crisper result at typical slide sizes.
       const rb = await sharp(f.buffer)
         .resize(1600, 900, { fit: 'cover', position: 'attention' })
-        .modulate({ brightness: 1.1, saturation: 0.85 })
+        .modulate({ brightness: 1.08, saturation: 0.9 })
         .jpeg({ quality: 92 })
         .toBuffer();
       refImgs.push('data:image/jpeg;base64,' + rb.toString('base64'));
     } catch (e) { /* skip bad image */ }
   }
 
-  // Per-slide targeted image selection. Each slide object (sd) may carry an
-  // `imageIndex` chosen upstream (by the AI planning step) that refers to the
-  // position of a specific uploaded reference image. If it's missing, out of
-  // range, or null, the slide simply gets no image (existing placeholder /
-  // no-image branches below handle that gracefully) instead of forcing
-  // whatever image happens to be "next" in a round-robin.
   const pickImg = (sd) => {
     const idx = sd && sd.imageIndex;
     if (typeof idx === 'number' && idx >= 0 && idx < refImgs.length) {
@@ -152,13 +125,6 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     return null;
   };
 
-  // ── PPTX ──────────────────────────────────────────────────────
-  // Document metadata fields (title/company/etc.) are written into the
-  // file's internal XML without pptxgenjs escaping them automatically the
-  // way it escapes text added to slides. A raw '&', '<', '>', or '"' in a
-  // client/event name breaks that XML and makes PowerPoint report the file
-  // as corrupt. Escaping here fixes that for ANY such character, not just
-  // the one that happened to show up so far.
   const escapeXml = (s) => String(s || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -171,131 +137,152 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
   pptx.title = escapeXml(eventData.eventName || 'Event Presentation');
   pptx.company = escapeXml(eventData.clientName || '');
 
-  // ── ICON SYSTEM ──────────────────────────────────────────────
-  // Maps a slide's title to a contextually fitting icon glyph. Using Unicode
-  // symbols/emoji (not rasterized images) means these render crisply at any
-  // zoom level, cost zero file size, need no extra dependencies on the
-  // server, and Windows/PowerPoint automatically falls back to a symbol
-  // font for any glyph Calibri itself doesn't contain (already proven by
-  // the calendar/pin icons already in use on the cover slide).
   const ICON_MAP = [
-    [/client|about/i, '\uD83D\uDC64'],
-    [/overview/i, '\uD83D\uDCCB'],
-    [/theme|design|concept/i, '\uD83C\uDFA8'],
-    [/venue/i, '\uD83D\uDCCD'],
-    [/schedule|timeline/i, '\uD83D\uDDD3'],
-    [/guest|experience/i, '\uD83D\uDC65'],
-    [/stage|decor/i, '\u2728'],
-    [/hospitality|catering/i, '\uD83C\uDF7D'],
-    [/logistics|operations/i, '\uD83D\uDE9A'],
-    [/why choose|why us/i, '\u2B50'],
-    [/thank/i, '\uD83D\uDC90']
+    [/client|about/i, '\u25EF'],
+    [/overview/i, '\u2261'],
+    [/theme|design|concept/i, '\u25C8'],
+    [/venue/i, '\u25C7'],
+    [/schedule|timeline/i, '\u29C9'],
+    [/guest|experience/i, '\u25CE'],
+    [/stage|decor/i, '\u2727'],
+    [/hospitality|catering/i, '\u25C9'],
+    [/logistics|operations/i, '\u2318'],
+    [/why choose|why us/i, '\u2606'],
+    [/thank/i, '\u2661']
   ];
   const pickIcon = (title) => {
     const t = String(title || '');
     for (const [re, icon] of ICON_MAP) {
       if (re.test(t)) return icon;
     }
-    return '\u2726'; // default: a neutral sparkle/star for anything unmatched
+    return '\u25C7';
   };
 
-  const addLogo = (slide) => {
+  const diamondDivider = (slide, cx, y, w, color) => {
+    const c = color || accent;
+    const gap = 0.16;
+    const half = (w - gap * 2) / 2;
+    slide.addShape(pptx.ShapeType.line, { x: cx - w / 2, y, w: half, h: 0, line: { color: c, width: 0.75 } });
+    slide.addShape(pptx.ShapeType.rect, { x: cx - 0.045, y: y - 0.045, w: 0.09, h: 0.09, rotate: 45, fill: { color: c } });
+    slide.addShape(pptx.ShapeType.line, { x: cx + gap, y, w: half, h: 0, line: { color: c, width: 0.75 } });
+  };
+
+  const cornerBrackets = (slide, color) => {
+    const c = color || accent, len = 0.42, o = 0.32, w = 0.75;
+    slide.addShape(pptx.ShapeType.line, { x: o, y: o, w: len, h: 0, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: o, y: o, w: 0, h: len, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: 10 - o - len, y: o, w: len, h: 0, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: 10 - o, y: o, w: 0, h: len, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: o, y: 5.63 - o, w: len, h: 0, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: o, y: 5.63 - o - len, w: 0, h: len, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: 10 - o - len, y: 5.63 - o, w: len, h: 0, line: { color: c, width: w } });
+    slide.addShape(pptx.ShapeType.line, { x: 10 - o, y: 5.63 - o - len, w: 0, h: len, line: { color: c, width: w } });
+  };
+
+  const framedImage = (slide, img, x, y, w, h) => {
+    slide.addShape(pptx.ShapeType.roundRect, {
+      x: x - 0.06, y: y - 0.06, w: w + 0.12, h: h + 0.12,
+      rectRadius: 0.06, fill: { color: white },
+      line: { color: hairline, width: 0.75 },
+      shadow: { type: 'outer', color: '000000', opacity: 0.18, blur: 10, offset: 3, angle: 90 }
+    });
+    slide.addImage({ data: img, x, y, w, h, rounding: false });
+  };
+
+  const addLogo = (slide, x, y, color) => {
     if (logoB64) {
-      slide.addImage({ data: logoB64, x: LOGO_X, y: LOGO_Y, w: LOGO_W, h: LOGO_H });
+      slide.addImage({ data: logoB64, x, y, w: LOGO_W, h: LOGO_H });
     } else {
-      slide.addShape(pptx.ShapeType.rect, { x: LOGO_X, y: LOGO_Y, w: LOGO_W, h: LOGO_H, fill: { color: white, alpha: 80 }, line: { color: white, width: 0.4 } });
-      slide.addText('LOGO', { x: LOGO_X, y: LOGO_Y, w: LOGO_W, h: LOGO_H, fontSize: 9, color: accent, align: 'center', fontFace: FONT, bold: true, valign: 'middle' });
+      slide.addShape(pptx.ShapeType.ellipse, { x, y, w: LOGO_W, h: LOGO_H, fill: { color: 'FFFFFF', alpha: 6 }, line: { color: color || accent, width: 0.75 } });
+      slide.addText('LOGO', { x, y, w: LOGO_W, h: LOGO_H, fontSize: 7, color: color || accent, align: 'center', fontFace: BODY, bold: true, valign: 'middle' });
     }
   };
 
   const addFooter = (slide, num) => {
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: FTR_Y, w: 10, h: FTR_H, fill: { color: accent } });
-    slide.addText(eventData.clientName || '', { x: ML, y: FTR_Y + 0.04, w: 4, h: 0.18, fontSize: 8, color: white, fontFace: FONT });
-    slide.addText(eventData.eventName || '', { x: 3.5, y: FTR_Y + 0.04, w: 3.5, h: 0.18, fontSize: 8, color: white, fontFace: FONT, align: 'center' });
-    if (num) slide.addText(String(num), { x: 9.3, y: FTR_Y + 0.04, w: 0.55, h: 0.18, fontSize: 8, color: white, align: 'right', fontFace: FONT });
+    slide.addShape(pptx.ShapeType.line, { x: ML, y: FTR_Y, w: MR - ML, h: 0, line: { color: hairline, width: 0.75 } });
+    slide.addText((eventData.clientName || '').toUpperCase(), { x: ML, y: FTR_Y + 0.06, w: 4, h: 0.2, fontSize: 7.5, color: textGrey, fontFace: BODY, charSpacing: 1 });
+    slide.addText((eventData.eventName || '').toUpperCase(), { x: 3, y: FTR_Y + 0.06, w: 4, h: 0.2, fontSize: 7.5, color: textGrey, fontFace: BODY, align: 'center', charSpacing: 1 });
+    if (num) slide.addText(String(num).padStart(2, '0'), { x: MR - 0.5, y: FTR_Y + 0.06, w: 0.5, h: 0.2, fontSize: 7.5, color: textGrey, align: 'right', fontFace: BODY, charSpacing: 1 });
   };
 
-  // H1 (slide title, in the header bar): icon badge + uppercase bold title.
-  // Bumped from 22pt to 24pt for a stronger visual anchor, and given its
-  // own small icon badge so every content-style slide carries the same
-  // consistent "icon + heading" pattern instead of plain text alone.
-  const addHeader = (slide, title) => {
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: HDR_H, fill: { color: accent } });
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.08, h: HDR_H, fill: { color: secondary } });
-    const badgeD = 0.42;
-    const badgeY = HDR_H / 2 - badgeD / 2;
-    slide.addShape(pptx.ShapeType.ellipse, { x: 0.24, y: badgeY, w: badgeD, h: badgeD, fill: { color: white, alpha: 85 } });
-    slide.addText(pickIcon(title), { x: 0.24, y: badgeY, w: badgeD, h: badgeD, fontSize: 16, align: 'center', valign: 'middle' });
-    slide.addText((title || '').toUpperCase(), { x: 0.8, y: 0.1, w: LOGO_X - 0.9, h: HDR_H - 0.2, fontSize: 24, bold: true, color: white, fontFace: FONT, charSpacing: 1, valign: 'middle' });
-    addLogo(slide);
+  const addHeading = (slide, title, eyebrow) => {
+    const icon = pickIcon(title);
+    slide.addText(icon + '   ' + (eyebrow || 'SECTION').toUpperCase(), {
+      x: ML, y: 0.42, w: MR - ML, h: 0.32, fontSize: 11, color: accent, fontFace: BODY, charSpacing: 3, bold: true
+    });
+    slide.addText(title || '', {
+      x: ML, y: 0.74, w: MR - ML, h: 0.72, fontSize: 30, color: textDark, fontFace: DISPLAY, italic: true, valign: 'top'
+    });
+    diamondDivider(slide, 5.0, 1.52, 2.2, accent);
+    addLogo(slide, MR - LOGO_W, 0.4, accent);
   };
-
-  const addPH = (slide, x, y, w, h, label) => {
-    slide.addShape(pptx.ShapeType.rect, { x, y, w, h, fill: { color: 'EDEAE3' }, line: { color: accent, width: 1.2, dashType: 'dash' } });
-    slide.addText('\uD83D\uDCF8', { x, y: y + h / 2 - 0.3, w, h: 0.5, fontSize: 20, align: 'center' });
-    slide.addText('[ ' + (label || 'Add Image Here') + ' ]', { x, y: y + h / 2 + 0.25, w, h: 0.32, fontSize: 9.5, color: accent, align: 'center', fontFace: FONT, italic: true });
-  };
-
-  const accentLine = (slide, x, y, w) => slide.addShape(pptx.ShapeType.rect, { x, y, w, h: 0.04, fill: { color: accent } });
-  const secLine = (slide, x, y, w) => slide.addShape(pptx.ShapeType.rect, { x, y, w, h: 0.04, fill: { color: secondary } });
 
   const buildCover = (sd) => {
     const slide = pptx.addSlide();
+    slide.background = { fill: darkColor };
+    cornerBrackets(slide, secondary);
+
     const img = pickImg(sd);
     if (img) {
-      slide.addImage({ data: img, x: 4.8, y: 0, w: 5.2, h: 5.63 });
-      slide.addShape(pptx.ShapeType.rect, { x: 4.8, y: 0, w: 5.2, h: 5.63, fill: { color: darkColor, alpha: 15 } });
-    } else {
-      slide.background = { fill: bgColor };
-      addPH(slide, 4.9, 0.15, 5.0, 5.3, 'Cover Image');
+      slide.addImage({ data: img, x: 0, y: 0, w: '100%', h: '100%' });
+      slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: 5.63, fill: { color: darkColor, alpha: 22 } });
     }
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 4.75, h: 5.63, fill: { color: darkColor } });
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 4.75, h: 0.12, fill: { color: secondary } });
-    slide.addShape(pptx.ShapeType.rect, { x: 4.62, y: 0, w: 0.13, h: 5.63, fill: { color: accent } });
-    if (logoB64) slide.addImage({ data: logoB64, x: 0.4, y: 0.22, w: 1.5, h: 0.72 });
-    else slide.addText('LOGO', { x: 0.4, y: 0.22, w: 1.5, h: 0.5, fontSize: 10, color: accent, fontFace: FONT, bold: true });
-    slide.addText((eventData.eventName || '').toUpperCase(), { x: 0.42, y: 1.1, w: 4.1, h: 1.7, fontSize: 32, bold: true, color: white, fontFace: FONT, charSpacing: 1, wrap: true });
-    accentLine(slide, 0.42, 2.95, 3.5);
-    secLine(slide, 0.42, 3.02, 2.0);
-    slide.addText('Presented to', { x: 0.42, y: 3.15, w: 4.1, h: 0.3, fontSize: 10, color: 'AAAAAA', fontFace: FONT });
-    slide.addText(eventData.clientName || '', { x: 0.42, y: 3.45, w: 4.1, h: 0.42, fontSize: 15, bold: true, color: white, fontFace: FONT });
-    slide.addText('\uD83D\uDCC5 ' + (eventData.eventDate || ''), { x: 0.42, y: 3.98, w: 4.1, h: 0.35, fontSize: 11, color: 'BBBBBB', fontFace: FONT });
-    slide.addText('\uD83D\uDCCD ' + (eventData.venue || ''), { x: 0.42, y: 4.35, w: 4.1, h: 0.35, fontSize: 11, color: 'BBBBBB', fontFace: FONT });
+
+    addLogo(slide, 4.69, 0.42, secondary);
+    slide.addText('PRESENTS', { x: 0, y: 1.16, w: 10, h: 0.3, fontSize: 11, color: secondary, align: 'center', fontFace: BODY, charSpacing: 4, bold: true });
+    slide.addText((eventData.eventBrief || eventData.theme || '').toString(), { x: 1, y: 1.5, w: 8, h: 0.4, fontSize: 13, color: 'D8CFC2', align: 'center', fontFace: DISPLAY, italic: true });
+
+    slide.addText(eventData.clientName || '', {
+      x: 0.4, y: 1.95, w: 9.2, h: 1.15, fontSize: 46, color: white, align: 'center', fontFace: DISPLAY, italic: true, wrap: true, fit: 'shrink'
+    });
+
+    diamondDivider(slide, 5.0, 3.18, 2.6, secondary);
+
+    slide.addText((eventData.eventName || sd.title || '').toUpperCase(), { x: 0, y: 3.32, w: 10, h: 0.4, fontSize: 18, color: white, align: 'center', fontFace: BODY, bold: true, charSpacing: 2 });
     if (eventData.theme) {
-      slide.addShape(pptx.ShapeType.rect, { x: 0.42, y: 4.78, w: 3.2, h: 0.4, fill: { color: accent } });
-      slide.addText('\u2726 ' + (eventData.theme || ''), { x: 0.44, y: 4.8, w: 3.16, h: 0.36, fontSize: 11, color: white, fontFace: FONT, bold: true });
+      slide.addText(eventData.theme, { x: 1, y: 3.72, w: 8, h: 0.35, fontSize: 12, color: secondary, align: 'center', fontFace: DISPLAY, italic: true });
     }
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 5.45, w: 4.75, h: 0.18, fill: { color: accent } });
+
+    const boxY = 4.35, boxH = 0.78, boxX = 1.4, boxW = 7.2;
+    slide.addShape(pptx.ShapeType.rect, { x: boxX, y: boxY, w: boxW, h: boxH, fill: { color: 'FFFFFF', alpha: 96 }, line: { color: secondary, width: 0.75 } });
+    const half = boxW / 2;
+    slide.addShape(pptx.ShapeType.line, { x: boxX + half, y: boxY + 0.14, w: 0, h: boxH - 0.28, line: { color: secondary, width: 0.5 } });
+    slide.addText('DATE', { x: boxX, y: boxY + 0.1, w: half, h: 0.2, fontSize: 8.5, color: secondary, align: 'center', fontFace: BODY, charSpacing: 2, bold: true });
+    slide.addText(eventData.eventDate || '', { x: boxX, y: boxY + 0.32, w: half, h: 0.36, fontSize: 13, color: white, align: 'center', fontFace: DISPLAY, italic: true });
+    slide.addText('VENUE', { x: boxX + half, y: boxY + 0.1, w: half, h: 0.2, fontSize: 8.5, color: secondary, align: 'center', fontFace: BODY, charSpacing: 2, bold: true });
+    slide.addText(eventData.venue || '', { x: boxX + half, y: boxY + 0.32, w: half, h: 0.36, fontSize: 13, color: white, align: 'center', fontFace: DISPLAY, italic: true });
   };
 
   const buildContent = (sd, useImg) => {
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
-    addHeader(slide, sd.title);
-    const img = useImg ? pickImg(sd) : null;
-    const TW = 5.65;
-    const IX = 6.08, IY = CTY + 0.05, IW = 3.65, IH = 4.35;
+    addHeading(slide, sd.title, (sd.slideType || 'section'));
 
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: TW, h: 0.38, fontSize: 13, color: accent, italic: true, fontFace: FONT });
-    accentLine(slide, ML, CTY + 0.42, 2.4);
+    const hasImg = useImg && pickImg(sd);
+    const TW = hasImg ? 4.9 : MR - ML;
+    const IX = 5.75, IY = 1.75, IW = 3.7, IH = 3.35;
 
-    const BY = sd.bodyText ? CTY + 0.55 : CTY + 0.48;
-    if (sd.bodyText) slide.addText(sd.bodyText, { x: ML, y: CTY + 0.52, w: TW, h: 0.65, fontSize: 11.5, color: textGrey, fontFace: FONT, wrap: true });
+    let y = 1.85;
+    if (sd.subtitle) {
+      slide.addText(sd.subtitle, { x: ML, y, w: TW, h: 0.34, fontSize: 12.5, color: accent, italic: true, fontFace: DISPLAY });
+      y += 0.46;
+    }
+    if (sd.bodyText) {
+      slide.addText(sd.bodyText, { x: ML, y, w: TW, h: 0.68, fontSize: 11.5, color: textGrey, fontFace: BODY, wrap: true, lineSpacingMultiple: 1.25 });
+      y += 0.8;
+    }
 
-    (sd.bulletPoints || []).forEach((pt, i) => {
-      const y = BY + (sd.bodyText ? 0.72 : 0) + i * 0.55;
-      slide.addShape(pptx.ShapeType.rect, { x: ML, y: y + 0.1, w: 0.06, h: 0.3, fill: { color: accent } });
-      slide.addShape(pptx.ShapeType.rect, { x: ML + 0.07, y: y + 0.22, w: TW - 0.1, h: 0.02, fill: { color: secondary, alpha: 80 } });
-      slide.addText(pt, { x: ML + 0.18, y, w: TW - 0.22, h: 0.48, fontSize: 12.5, color: textDark, fontFace: FONT, wrap: true });
+    (sd.bulletPoints || []).forEach((pt) => {
+      slide.addShape(pptx.ShapeType.rect, { x: ML, y: y + 0.09, w: 0.07, h: 0.07, rotate: 45, fill: { color: accent } });
+      slide.addText(pt, { x: ML + 0.22, y, w: TW - 0.3, h: 0.46, fontSize: 12, color: textDark, fontFace: BODY, wrap: true, lineSpacingMultiple: 1.1 });
+      y += 0.5;
     });
 
-    if (img) {
-      slide.addImage({ data: img, x: IX, y: IY, w: IW, h: IH });
-      slide.addShape(pptx.ShapeType.rect, { x: IX, y: IY, w: IW, h: IH, fill: { color: white, alpha: 92 } });
-      slide.addShape(pptx.ShapeType.rect, { x: IX - 0.08, y: IY, w: 0.08, h: IH, fill: { color: accent } });
-      slide.addShape(pptx.ShapeType.rect, { x: IX, y: IY + IH - 0.05, w: IW, h: 0.05, fill: { color: secondary } });
+    if (hasImg) {
+      framedImage(slide, pickImg(sd), IX, IY, IW, IH);
     } else if (useImg) {
-      addPH(slide, IX, IY, IW, IH, 'Add Image Here');
+      slide.addShape(pptx.ShapeType.roundRect, { x: IX, y: IY, w: IW, h: IH, rectRadius: 0.06, fill: { color: 'F2EEE6' }, line: { color: hairline, width: 0.75, dashType: 'dash' } });
+      slide.addText('[ space reserved for image ]', { x: IX, y: IY + IH / 2 - 0.2, w: IW, h: 0.4, fontSize: 10, color: accent, align: 'center', fontFace: DISPLAY, italic: true });
     }
     addFooter(slide, sd.slideNumber);
   };
@@ -305,84 +292,84 @@ async function buildPresentation({ inputData, slides, eventData, logoFile, refFi
     const img = pickImg(sd);
     if (img) {
       slide.addImage({ data: img, x: 0, y: 0, w: '100%', h: '100%' });
-      slide.addShape(pptx.ShapeType.rect, { x: 0, y: 3.45, w: 10, h: 2.18, fill: { color: darkColor, alpha: 28 } });
-      slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: 0.1, fill: { color: accent } });
+      slide.addShape(pptx.ShapeType.rect, { x: 0, y: 3.7, w: 10, h: 1.93, fill: { color: darkColor, alpha: 30 } });
     } else {
       slide.background = { fill: darkColor };
-      addPH(slide, 0.4, 0.2, 9.2, 3.05, 'Visual / Decor Image');
     }
-    addLogo(slide);
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 3.45, w: 0.12, h: 2.18, fill: { color: accent } });
-    slide.addShape(pptx.ShapeType.rect, { x: 0.18, y: 3.45, w: 0.04, h: 2.18, fill: { color: secondary, alpha: 70 } });
-    slide.addText((sd.title || '').toUpperCase(), { x: 0.28, y: 3.55, w: 9.0, h: 0.75, fontSize: 28, bold: true, color: white, fontFace: FONT, charSpacing: 1 });
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: 0.28, y: 4.35, w: 7.5, h: 0.42, fontSize: 13, color: 'DDDDDD', fontFace: FONT, italic: true });
+    addLogo(slide, MR - LOGO_W, 0.35, secondary);
+    diamondDivider(slide, 1.7, 3.95, 1.3, secondary);
+    slide.addText((sd.title || '').toUpperCase(), { x: 0.55, y: 4.08, w: 8.5, h: 0.6, fontSize: 26, color: white, fontFace: DISPLAY, italic: true });
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: 0.55, y: 4.68, w: 8, h: 0.4, fontSize: 12.5, color: 'E6DFD3', fontFace: BODY, italic: false, charSpacing: 1 });
     addFooter(slide, sd.slideNumber);
   };
 
   const buildTimeline = (sd) => {
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
-    addHeader(slide, sd.title);
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 13, color: accent, italic: true, fontFace: FONT, align: 'center' });
+    addHeading(slide, sd.title, 'timeline');
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: 1.82, w: MR - ML, h: 0.32, fontSize: 12.5, color: accent, italic: true, fontFace: DISPLAY, align: 'center' });
+
     const pts = (sd.bulletPoints || []).slice(0, 6);
     const cols = pts.length || 1;
-    const colW = 9.2 / cols;
-    const lineY = 2.28;
-    slide.addShape(pptx.ShapeType.rect, { x: 0.6, y: lineY + 0.37, w: 8.8, h: 0.05, fill: { color: accent, alpha: 55 } });
+    const colW = (MR - ML) / cols;
+    const lineY = 2.85;
+    slide.addShape(pptx.ShapeType.line, { x: ML + 0.4, y: lineY, w: (MR - ML) - 0.8, h: 0, line: { color: hairline, width: 1 } });
     pts.forEach((pt, i) => {
-      const cx = 0.4 + i * colW + colW / 2;
-      slide.addShape(pptx.ShapeType.ellipse, { x: cx - 0.4, y: lineY, w: 0.8, h: 0.8, fill: { color: accent } });
-      slide.addShape(pptx.ShapeType.ellipse, { x: cx - 0.35, y: lineY + 0.05, w: 0.7, h: 0.7, fill: { color: secondary, alpha: 70 } });
-      slide.addText(String(i + 1), { x: cx - 0.4, y: lineY + 0.07, w: 0.8, h: 0.66, fontSize: 18, bold: true, color: white, align: 'center', fontFace: FONT });
+      const cx = ML + i * colW + colW / 2;
+      slide.addShape(pptx.ShapeType.ellipse, { x: cx - 0.22, y: lineY - 0.22, w: 0.44, h: 0.44, fill: { color: bgColor }, line: { color: accent, width: 1 } });
+      slide.addText(String(i + 1).padStart(2, '0'), { x: cx - 0.22, y: lineY - 0.19, w: 0.44, h: 0.38, fontSize: 11, bold: true, color: accent, align: 'center', fontFace: BODY });
       const parts = pt.split(':');
-      slide.addText(parts[0].trim(), { x: cx - colW / 2 + 0.05, y: lineY + 0.92, w: colW - 0.1, h: 0.44, fontSize: 10.5, bold: true, color: textDark, align: 'center', fontFace: FONT });
-      if (parts[1]) slide.addText(parts[1].trim(), { x: cx - colW / 2 + 0.05, y: lineY + 1.38, w: colW - 0.1, h: 0.9, fontSize: 9.5, color: textGrey, align: 'center', fontFace: FONT, wrap: true });
+      slide.addText(parts[0].trim(), { x: cx - colW / 2 + 0.06, y: lineY + 0.32, w: colW - 0.12, h: 0.4, fontSize: 12, bold: true, color: textDark, align: 'center', fontFace: DISPLAY, italic: true });
+      if (parts[1]) slide.addText(parts[1].trim(), { x: cx - colW / 2 + 0.06, y: lineY + 0.74, w: colW - 0.12, h: 1.0, fontSize: 9.5, color: textGrey, align: 'center', fontFace: BODY, wrap: true, lineSpacingMultiple: 1.15 });
     });
-    if (sd.bodyText) slide.addText(sd.bodyText, { x: 0.5, y: 4.55, w: 9, h: 0.55, fontSize: 11, color: textGrey, fontFace: FONT, align: 'center' });
+    if (sd.bodyText) slide.addText(sd.bodyText, { x: 0.8, y: 4.7, w: 8.4, h: 0.5, fontSize: 10.5, color: textGrey, fontFace: BODY, align: 'center', italic: true });
     addFooter(slide, sd.slideNumber);
   };
 
   const buildHighlight = (sd) => {
     const slide = pptx.addSlide();
     slide.background = { fill: bgColor };
-    addHeader(slide, sd.title);
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: CTY, w: 9.3, h: 0.35, fontSize: 13, color: accent, italic: true, fontFace: FONT });
+    addHeading(slide, sd.title, 'highlights');
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: ML, y: 1.82, w: MR - ML, h: 0.32, fontSize: 12.5, color: accent, italic: true, fontFace: DISPLAY, align: 'center' });
+
     const pts = (sd.bulletPoints || []).slice(0, 3);
-    const colW = 9.2 / pts.length;
+    const gap = 0.22;
+    const colW = ((MR - ML) - gap * (pts.length - 1)) / pts.length;
     pts.forEach((pt, i) => {
-      const cx = 0.4 + i * colW;
-      slide.addShape(pptx.ShapeType.rect, { x: cx + 0.1, y: 1.48, w: colW - 0.25, h: 3.6, fill: { color: white }, line: { color: 'DDD9D0', width: 0.5 } });
-      slide.addShape(pptx.ShapeType.rect, { x: cx + 0.1, y: 1.48, w: colW - 0.25, h: 0.08, fill: { color: accent } });
-      slide.addShape(pptx.ShapeType.rect, { x: cx + 0.1, y: 1.56, w: colW - 0.25, h: 0.04, fill: { color: secondary } });
-      slide.addShape(pptx.ShapeType.ellipse, { x: cx + colW / 2 - 0.38, y: 1.7, w: 0.76, h: 0.76, fill: { color: bgColor } });
-      slide.addText(pickIcon(pt), { x: cx + colW / 2 - 0.38, y: 1.76, w: 0.76, h: 0.64, fontSize: 22, color: accent, align: 'center' });
+      const cx = ML + i * (colW + gap);
+      slide.addShape(pptx.ShapeType.roundRect, {
+        x: cx, y: 2.32, w: colW, h: 2.75, rectRadius: 0.08,
+        fill: { color: white }, line: { color: hairline, width: 0.75 },
+        shadow: { type: 'outer', color: '000000', opacity: 0.12, blur: 8, offset: 2, angle: 90 }
+      });
+      slide.addShape(pptx.ShapeType.ellipse, { x: cx + colW / 2 - 0.3, y: 2.55, w: 0.6, h: 0.6, fill: { color: bgColor }, line: { color: accent, width: 0.75 } });
+      slide.addText(pickIcon(pt), { x: cx + colW / 2 - 0.3, y: 2.55, w: 0.6, h: 0.6, fontSize: 18, color: accent, align: 'center', valign: 'middle', fontFace: DISPLAY });
       const parts = pt.split(':');
-      slide.addText(parts[0].trim(), { x: cx + 0.2, y: 2.55, w: colW - 0.45, h: 0.45, fontSize: 12.5, bold: true, color: textDark, align: 'center', fontFace: FONT });
-      if (parts[1]) slide.addText(parts[1].trim(), { x: cx + 0.2, y: 3.05, w: colW - 0.45, h: 1.7, fontSize: 11, color: textGrey, align: 'center', fontFace: FONT, wrap: true });
-      slide.addShape(pptx.ShapeType.rect, { x: cx + colW / 2 - 0.5, y: 4.85, w: 1.0, h: 0.04, fill: { color: secondary } });
+      slide.addText(parts[0].trim(), { x: cx + 0.15, y: 3.35, w: colW - 0.3, h: 0.42, fontSize: 13, bold: false, color: textDark, align: 'center', fontFace: DISPLAY, italic: true });
+      diamondDivider(slide, cx + colW / 2, 3.85, 0.6, secondary);
+      if (parts[1]) slide.addText(parts[1].trim(), { x: cx + 0.2, y: 3.98, w: colW - 0.4, h: 1.0, fontSize: 10, color: textGrey, align: 'center', fontFace: BODY, wrap: true, lineSpacingMultiple: 1.15 });
     });
     addFooter(slide, sd.slideNumber);
   };
 
   const buildClosing = (sd) => {
     const slide = pptx.addSlide();
-    const img = pickImg(sd);
-    if (img) {
-      slide.addImage({ data: img, x: 0, y: 0, w: '100%', h: '100%' });
-      slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 10, h: 5.63, fill: { color: darkColor, alpha: 38 } });
-    } else {
-      slide.background = { fill: darkColor };
-      slide.addShape(pptx.ShapeType.rect, { x: 2.5, y: 0, w: 5, h: 5.63, fill: { color: accent, alpha: 90 } });
-    }
-    if (logoB64) slide.addImage({ data: logoB64, x: 4.25, y: 0.28, w: 1.5, h: 0.72 });
-    slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 1.52, w: 4.4, h: 0.05, fill: { color: accent } });
-    slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 1.6, w: 4.4, h: 0.03, fill: { color: secondary, alpha: 70 } });
-    slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 4.08, w: 4.4, h: 0.05, fill: { color: accent } });
-    slide.addShape(pptx.ShapeType.rect, { x: 2.8, y: 4.02, w: 4.4, h: 0.03, fill: { color: secondary, alpha: 70 } });
-    slide.addText((sd.title || 'Thank You').toUpperCase(), { x: 0.5, y: 1.75, w: 9, h: 1.4, fontSize: 48, bold: true, color: white, align: 'center', fontFace: FONT, charSpacing: 2 });
-    if (sd.subtitle) slide.addText(sd.subtitle, { x: 1, y: 3.28, w: 8, h: 0.55, fontSize: 15, color: 'CCCCCC', align: 'center', fontFace: FONT, italic: true });
-    slide.addText((eventData.clientName || '').toUpperCase(), { x: 0.5, y: 4.22, w: 9, h: 0.4, fontSize: 13, color: accent, align: 'center', fontFace: FONT, bold: true, charSpacing: 2 });
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 5.45, w: 10, h: 0.18, fill: { color: accent } });
+    slide.background = { fill: darkColor };
+    cornerBrackets(slide, secondary);
+
+    addLogo(slide, 4.69, 0.55, secondary);
+    slide.addText('WITH LOVE', { x: 0, y: 1.3, w: 10, h: 0.3, fontSize: 11, color: secondary, align: 'center', fontFace: BODY, charSpacing: 4, bold: true });
+
+    slide.addText((sd.title || 'Thank You'), {
+      x: 0.5, y: 1.68, w: 9, h: 1.1, fontSize: 54, color: white, align: 'center', fontFace: DISPLAY, italic: true, fit: 'shrink'
+    });
+    diamondDivider(slide, 5.0, 2.86, 2.2, secondary);
+    if (sd.subtitle) slide.addText(sd.subtitle, { x: 1, y: 3.02, w: 8, h: 0.5, fontSize: 14, color: 'D8CFC2', align: 'center', fontFace: DISPLAY, italic: true });
+
+    slide.addText(
+      [eventData.eventDate, eventData.venue].filter(Boolean).join('   \u00B7   ').toUpperCase(),
+      { x: 0.5, y: 4.55, w: 9, h: 0.35, fontSize: 11, color: secondary, align: 'center', fontFace: BODY, charSpacing: 2, bold: true }
+    );
   };
 
   for (const sd of slides) {
