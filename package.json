@@ -10,6 +10,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.10",
     "express": "^4.19.2",
     "multer": "^2.0.1",
     "pptxgenjs": "^3.12.0",
