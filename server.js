@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const PptxGenJS = require('pptxgenjs');
 const sharp = require('sharp');
+const { buildWeddingFromTemplate } = require('./wedding-template-engine');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -63,7 +64,9 @@ app.post('/generate-pptx', upload.any(), async (req, res) => {
       }
     }
 
-    const buf = await buildPresentation({ inputData, slides, eventData, logoFile, refFiles });
+    const buf = /wedding/i.test(eventData.eventCategory || '')
+      ? await buildWeddingFromTemplate({ eventData, refFiles, logoFile })
+      : await buildPresentation({ inputData, slides, eventData, logoFile, refFiles });
 
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
     res.set('Content-Disposition', `attachment; filename="presentation.pptx"`);
